@@ -14,6 +14,7 @@ import { RouteMatcher } from './Matchers.js';
 import { FetchMockConfig } from './FetchMock.js';
 import { hasCredentialsInUrl } from './RequestUtils.js';
 import type { CallLog } from './CallHistory.js';
+import { Type } from './TypeDescriptor.js';
 
 export type ResponseConfigProp =
 	| 'body'
@@ -33,6 +34,11 @@ const responseConfigProps: ResponseConfigProp[] = [
 	'status',
 	'redirectUrl',
 ];
+
+type ProxiedReadableStream = ReadableStream & {
+	_lockingReader?: ReadableStreamReader<unknown>;
+	_abortStream: (error: Error) => void;
+};
 
 function nameToOptions(options: RouteConfig | string): RouteConfig {
 	return typeof options === 'string' ? { name: options } : options;
@@ -176,8 +182,13 @@ export default class Router {
 					}
 
 					if (callLog?.response?.body) {
+						(callLog.response.body as ProxiedReadableStream)._abortStream(
+							error,
+						);
 						if (callLog.response.body.locked) {
-							callLog.response.body.getReader().cancel(error);
+							(
+								callLog.response.body as ProxiedReadableStream
+							)._lockingReader?.cancel(error);
 						} else {
 							callLog.response.body.cancel(error);
 						}
@@ -203,14 +214,15 @@ export default class Router {
 					callLog.route = route;
 					const { response, responseOptions, responseInput } =
 						await this.generateResponse(callLog);
+					const abortableResponse = this.createAbortableResponse(response);
 					const observableResponse = this.createObservableResponse(
-						response,
+						abortableResponse,
 						responseOptions,
 						responseInput,
 						url,
 						pendingPromises,
 					);
-					callLog.response = response;
+					callLog.response = abortableResponse;
 					resolve(observableResponse);
 				} catch (err) {
 					reject(err);
@@ -296,6 +308,110 @@ export default class Router {
 									//@ts-expect-error TODO probably make use of generics here
 									result.catch(() => undefined),
 								);
+							}
+							return result;
+						},
+					});
+				}
+				//@ts-expect-error TODO probably make use of generics here
+				return originalResponse[name];
+			},
+		});
+	}
+
+	createAbortableResponse(response: Response): Response {
+		type ReaderType = ReturnType<typeof response.body.getReader>;
+		let lockingReader: ReaderType | undefined;
+		let isAborted = false;
+		let abortStream: (error: Error) => void;
+		const abortPromise = new Promise((_, reject) => {
+			abortStream = (err: Error) => {
+				isAborted = true;
+				reject(err);
+			};
+		});
+		const makeReaderProxy = (reader: ReaderType) => {
+			return new Proxy(reader, {
+				get(originalReader, name) {
+					if (name === 'read') {
+						return new Proxy(originalReader.read, {
+							apply: (func, thisArg, args) => {
+								return isAborted
+									? abortPromise
+									: Promise.race([
+											abortPromise,
+											//@ts-expect-error TODO probably make use of generics here
+											func.apply(originalReader, args),
+										]);
+							},
+						});
+					}
+					if (name === 'releaseLock') {
+						return new Proxy(originalReader.releaseLock, {
+							apply: (func, thisArg, args) => {
+								if (lockingReader === originalReader) {
+									lockingReader = undefined;
+								}
+								//@ts-expect-error TODO probably make use of generics here
+								return func.apply(originalReader, args);
+							},
+						});
+					}
+					if (name === 'closed') {
+						return isAborted
+							? abortPromise
+							: Promise.race([abortPromise, originalReader.closed]);
+					}
+					const prop = Reflect.get(originalReader, name);
+					return Type.isFunction(prop) ? prop.bind(originalReader) : prop;
+				},
+			});
+		};
+		const body = Type.isObject(response.body)
+			? new Proxy(response.body, {
+					get(originalBody, name) {
+						if (name === '_abortStream') {
+							return abortStream;
+						}
+						if (name === '_lockingReader') {
+							return lockingReader;
+						}
+						if (name === 'getReader') {
+							return new Proxy(originalBody.getReader, {
+								apply: (func, thisArg, args) => {
+									//@ts-expect-error TODO probably make use of generics here
+									const reader = func.apply(originalBody, args);
+									lockingReader = reader;
+									return makeReaderProxy(reader);
+								},
+							});
+						}
+						const prop = Reflect.get(originalBody, name);
+						return Type.isFunction(prop) ? prop.bind(originalBody) : prop;
+					},
+				})
+			: response.body;
+		return new Proxy(response, {
+			get: (originalResponse, name) => {
+				if (name === 'body') {
+					return body;
+				}
+				// TODO fix these types properly
+				//@ts-expect-error TODO probably make use of generics here
+				if (typeof response[name] === 'function') {
+					//@ts-expect-error TODO probably make use of generics here
+					return new Proxy(response[name], {
+						apply: (func, thisArg, args) => {
+							const result = func.apply(response, args);
+							if (result.then) {
+								if (isAborted && result.catch) {
+									result.catch(() => {
+										/* muffle */
+									});
+								}
+								return isAborted
+									? abortPromise
+									: Promise.race([abortPromise, result]);
 							}
 							return result;
 						},

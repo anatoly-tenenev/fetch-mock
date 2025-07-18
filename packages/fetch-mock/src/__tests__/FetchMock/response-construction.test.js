@@ -130,6 +130,20 @@ describe('response construction', () => {
 			expect(receivedData).to.eql('test value');
 			expect(res.headers.get('content-length')).toBe(null);
 		});
+
+		it('respond with ReadableStream by using the body reader', async () => {
+			const body = new Blob(['test value']).stream();
+			fm.route('*', body);
+			const res = await fm.fetchHandler('http://a.com');
+			const reader = res.body.getReader();
+			const readRes = reader.read();
+			expect(readRes).toBeInstanceOf(Promise);
+			const data = await readRes;
+			expect(data.done).toBeTypeOf('boolean');
+			expect(data.value).toBeInstanceOf(Uint8Array);
+			const decoder = new TextDecoder('utf-8');
+			expect(decoder.decode(data.value)).toEqual('test value');
+		});
 	});
 	describe('structured data', () => {
 		it('respond with FormData', async () => {
